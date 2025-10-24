@@ -1,13 +1,15 @@
-/* ========================================================= 
+/* =========================================================
    Controle de Velocidade por PID (Arduino UNO + L293D)
    Autores: Wícolly Pedro Alcântara; Fernando Frazão Moreira Nunes
-   Observações de hardware (coerentes com sua montagem):
-   - Motores via L293D com EN nos pinos PWM 5 e 6.
-   - Buzzer no 13, LEDs no 12 (vermelho) e 11 (verde).
-   - Sensor ultrassônico PING))) no pino 8 (um fio SIG).
-   - Tacômetro (IR refletivo ou Hall) em D3 (INT1). Para isso,
-     movemos IN2 do L293D do D3 para o D9. Demais fios permanecem.
+   =========================================================
+   Hardware:
+   - L293D: EN12->D5 (PWM), EN34->D6 (PWM), IN1->D2, IN2->D9, IN3->D4, IN4->D7
+   - Tacômetro (IR/Hall): D3 (INT1, RISING), com INPUT_PULLUP
+   - PING))) (um fio): D8 (SIG único, toggle OUTPUT/INPUT na leitura)
+   - Buzzer D13, LED vermelho D12, LED verde D11
+   - GND da fonte de motor em COMUM com GND do Arduino
    ========================================================= */
+
 
 
 /* ================= PINOUT ================= */
@@ -18,7 +20,7 @@ const int LED_G  = 11;
 const int ULTRA_SIG = 8;   // PING))) SIG (um fio)
 
 const int IN1   = 2;       // direção motor A
-const int IN2   = 9;       // (MOVIDO do D3 para D9 p/ liberar INT1 ao tacômetro)
+const int IN2   = 9;       // direção motor A
 const int EN12  = 5;       // PWM motor A (enable)
 
 const int IN3   = 4;       // direção motor B
@@ -28,13 +30,13 @@ const int EN34  = 6;       // PWM motor B (enable)
 const int TAC_PIN = 3;     // Tacômetro em INT1 (D3)
 
 /* ================ PARÂMETROS ================ */
-// Segurança por ultrassom (opcional, manter conforme sua montagem)
+// Segurança por ultrassom
 #define USE_SAFETY_ULTRA 1
-const int   FREIO_CM     = 35;     // parada de emergência
-const int   DIST_OK_CM   = 100;    // apenas para LED/buzzer informativo
+const int   FREIO_CM     = 35;     // <= freia por completo (short-brake)
+const int   DIST_OK_CM   = 100;    // acima disso, sem limitação de PWM
 
 // PID de velocidade (RPM)
-const int   SETPOINT_RPM = 1200;   // alvo de velocidade
+const int   SETPOINT_RPM = 1200;   // alvo de velocidade (ajuste conforme)
 const float Kp = 0.8f;
 const float Ki = 0.15f;
 const float Kd = 0.02f;
@@ -67,6 +69,7 @@ void  pararMotores();
 float rpmMedida();
 int   pidStep(float r, float y);
 void  onPulse();
+int   pwmCapFromDist(float d);
 
 /* ================== SETUP ================== */
 void setup() {
@@ -84,7 +87,7 @@ void setup() {
   pinMode(IN3, OUTPUT);
   pinMode(IN4, OUTPUT);
 
-  pinMode(ULTRA_SIG, OUTPUT); // configurado dinamicamente na leitura
+  // ULTRA_SIG será alternado na função de medida (OUTPUT->INPUT). Não fixar aqui.
 
   // Tacômetro (entrada com pullup — típico em sensores Hall open-collector)
   pinMode(TAC_PIN, INPUT_PULLUP);
@@ -96,7 +99,7 @@ void setup() {
   digitalWrite(LED_R, LOW);
 
   // Cabeçalho do logger (CSV)
-  Serial.println(F("t_ms,set_rpm,rpm,pwm,dist_cm"));
+  Serial.println(F("t_ms,set_rpm,rpm,pwm,dist_cm,pwm_cap"));
   tLoop = millis();
 }
 
@@ -108,12 +111,13 @@ void loop() {
   // Medida de velocidade (RPM)
   float y = rpmMedida();
 
-  // Segurança por distância (opcional)
+  // Segurança por distância
   float dist = 999.0f;
 #if USE_SAFETY_ULTRA
   dist = medirDistanciaCM();
+
+  // Emergência: short-brake abaixo/igual ao FREIO_CM
   if (dist <= FREIO_CM) {
-    // emergência: frear e sinalizar
     freioAtivo();
     digitalWrite(LED_G, LOW);
     digitalWrite(LED_R, HIGH);
@@ -127,13 +131,19 @@ void loop() {
     Serial.print(SETPOINT_RPM); Serial.print(',');
     Serial.print(y); Serial.print(',');
     Serial.print(0); Serial.print(',');
-    Serial.println(dist);
+    Serial.print(dist); Serial.print(',');
+    Serial.println(0); // pwm_cap = 0
     return;
   }
 #endif
 
-  // Caso normal: controle por PID
+  // Controle por PID no setpoint desejado
   int u = pidStep((float)SETPOINT_RPM, y);
+
+  // Cap de segurança progressivo pela distância
+  int cap = pwmCapFromDist(dist);
+  u = min(u, cap);
+
   aplicarPWM(u);
 
   // Indicadores
@@ -146,11 +156,13 @@ void loop() {
   Serial.print(SETPOINT_RPM); Serial.print(',');
   Serial.print(y); Serial.print(',');
   Serial.print(u); Serial.print(',');
-  Serial.println(dist);
+  Serial.print(dist); Serial.print(',');
+  Serial.println(cap);
 }
 
 /* ============= MEDIÇÃO DE DISTÂNCIA (PING))) ============= */
 float medirDistanciaCM() {
+  // Pulso de trigger (modo OUTPUT)
   pinMode(ULTRA_SIG, OUTPUT);
   digitalWrite(ULTRA_SIG, LOW);
   delayMicroseconds(2);
@@ -158,15 +170,16 @@ float medirDistanciaCM() {
   delayMicroseconds(5);
   digitalWrite(ULTRA_SIG, LOW);
 
+  // Leitura do echo (modo INPUT)
   pinMode(ULTRA_SIG, INPUT);
-  unsigned long dur = pulseIn(ULTRA_SIG, HIGH, 30000UL); // timeout 30 ms
+  unsigned long dur = pulseIn(ULTRA_SIG, HIGH, 30000UL); // timeout 30 ms (~5 m)
   if (dur == 0) return 999.0f;
   return dur / 58.0f; // us->cm (aprox.)
 }
 
 /* ============= MOTORES / L293D ============= */
 void setDirecaoFrente() {
-  // Ajuste se sua montagem exigir inversão:
+  // Ajuste LOW/HIGH aqui se algum motor estiver invertido
   digitalWrite(IN1, LOW);
   digitalWrite(IN2, HIGH);
 
@@ -191,9 +204,9 @@ void pararMotores() {
 }
 
 void freioAtivo() {
-  analogWrite(EN12, 0);
-  analogWrite(EN34, 0);
-  // “short brake”: entradas iguais
+  // Short-brake REAL: EN alto e entradas iguais
+  analogWrite(EN12, PWM_MAX);
+  analogWrite(EN34, PWM_MAX);
   digitalWrite(IN1, HIGH);
   digitalWrite(IN2, HIGH);
   digitalWrite(IN3, HIGH);
@@ -246,10 +259,20 @@ int pidStep(float r, float y) {
   // Anti-windup (back-calculation)
   Iterm += Ki * Ts * (r - y) + Kt * (u - v);
 
-  // (opcional) limitar Iterm a uma faixa segura
-  if (Iterm > PWM_MAX) Iterm = PWM_MAX;
+  // Limitar Iterm a uma faixa segura
+  if (Iterm > PWM_MAX)  Iterm = PWM_MAX;
   if (Iterm < -PWM_MAX) Iterm = -PWM_MAX;
 
   y_prev = y;
   return (int)u;
+}
+
+/* ============= CAP DE PWM POR DISTÂNCIA (Rampa) ============= */
+// DIST_OK_CM -> 255 ; FREIO_CM -> 0 ; interpolação linear no meio
+int pwmCapFromDist(float d) {
+  if (d >= DIST_OK_CM) return PWM_MAX;
+  if (d <= FREIO_CM)   return 0;
+  float f = (d - FREIO_CM) / (float)(DIST_OK_CM - FREIO_CM); // 0..1
+  int cap = (int)(f * PWM_MAX);
+  return constrain(cap, 0, PWM_MAX);
 }

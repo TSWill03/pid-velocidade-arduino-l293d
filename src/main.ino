@@ -9,7 +9,6 @@
      movemos IN2 do L293D do D3 para o D9. Demais fios permanecem.
    ========================================================= */
 
-#include <Arduino.h>
 
 /* ================= PINOUT ================= */
 const int BUZZ   = 13;
